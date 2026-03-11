@@ -1,10 +1,10 @@
 """
-Fake News Detector using DistilBERT  (CPU-friendly)
-=====================================================
-Uses DistilBERT instead of full BERT — 40% faster, same accuracy.
+Fake News Detector — Lightweight CPU Version
+=============================================
+Uses TF-IDF + Logistic Regression (no GPU needed, runs in ~1-2 minutes)
 
 Install:
-    pip install transformers torch scikit-learn pandas numpy tqdm
+    pip install scikit-learn pandas numpy
 
 Usage:
     python fake_news_detector.py --train fakenews.csv
@@ -13,87 +13,41 @@ Usage:
 
 import argparse
 import os
-import warnings
-import logging
+import pickle
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
-# Suppress noisy warnings
-warnings.filterwarnings("ignore")
-logging.getLogger("transformers").setLevel(logging.ERROR)
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-import torch
-from torch.utils.data import Dataset, DataLoader
-from torch.optim import AdamW
-
-from transformers import (
-    DistilBertTokenizerFast,
-    DistilBertForSequenceClassification,
-    get_linear_schedule_with_warmup,
-)
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
-    classification_report,
     accuracy_score,
     f1_score,
+    precision_score,
+    recall_score,
+    classification_report,
+    confusion_matrix,
 )
+from sklearn.pipeline import Pipeline
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ─── Config ───────────────────────────────────────────────────────────────────
 
-# DistilBERT = 40% faster than BERT, ~97% of its accuracy, great for CPU
-MODEL_NAME    = "distilbert-base-uncased"
-MAX_LEN       = 128        # reduced from 256 = 4x faster tokenization on CPU
-BATCH_SIZE    = 8          # small batch for CPU memory
-EPOCHS        = 3
-LEARNING_RATE = 2e-5
-MODEL_SAVE    = "bert_fakenews_model"
-DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_SAVE = "fakenews_model.pkl"
 
-# ─── Dataset ──────────────────────────────────────────────────────────────────
-
-class FakeNewsDataset(Dataset):
-    def __init__(self, texts, labels, tokenizer, max_len=MAX_LEN):
-        # Tokenize everything upfront (faster than per-item)
-        self.encodings = tokenizer(
-            texts,
-            add_special_tokens=True,
-            max_length=max_len,
-            padding="max_length",
-            truncation=True,
-            return_attention_mask=True,
-        )
-        self.labels = labels
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        return {
-            "input_ids":      torch.tensor(self.encodings["input_ids"][idx],      dtype=torch.long),
-            "attention_mask": torch.tensor(self.encodings["attention_mask"][idx], dtype=torch.long),
-            "label":          torch.tensor(self.labels[idx],                      dtype=torch.long),
-        }
-
-# ─── Data loading ─────────────────────────────────────────────────────────────
+# ─── Data Loading ─────────────────────────────────────────────────────────────
 
 def load_dataset(csv_path: str) -> pd.DataFrame:
-    """
-    Loads CSV. Expected columns: title (optional), text, label
-    label: 0 = REAL, 1 = FAKE  (or string 'real'/'fake')
-    """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
             f"\n  File not found: '{csv_path}'\n"
-            f"  Make sure fakenews.csv is in the same folder as this script.\n"
+            f"  Make sure fakenews.csv is in the same folder.\n"
             f"  Current directory: {os.getcwd()}\n"
         )
 
     df = pd.read_csv(csv_path)
     df.columns = df.columns.str.lower().str.strip()
 
-    # Combine title + text if both present
+    # Combine title + text if both exist
     if "title" in df.columns and "text" in df.columns:
         df["text"] = df["title"].fillna("") + " " + df["text"].fillna("")
     elif "text" not in df.columns:
@@ -102,14 +56,14 @@ def load_dataset(csv_path: str) -> pd.DataFrame:
     if "label" not in df.columns:
         raise ValueError("CSV must have a 'label' column (0=real, 1=fake).")
 
-    # Handle string labels like 'fake' / 'real'
+    # Handle string labels
     if df["label"].dtype == object:
         df["label"] = df["label"].str.lower().map({"fake": 1, "real": 0, "0": 0, "1": 1})
 
     df = df[["text", "label"]].dropna()
     df["label"] = df["label"].astype(int)
     df["text"]  = df["text"].astype(str).str.strip()
-    df = df[df["text"].str.len() > 10]   # drop blank rows
+    df = df[df["text"].str.len() > 10]
 
     print(f"\n  Dataset loaded: {len(df)} samples")
     print(f"  REAL (0): {(df.label==0).sum()}  |  FAKE (1): {(df.label==1).sum()}")
@@ -119,194 +73,132 @@ def load_dataset(csv_path: str) -> pd.DataFrame:
 
 def train_model(csv_path: str):
     print(f"\n{'='*58}")
-    print("  Fake News Detector — DistilBERT Fine-tuning")
-    print(f"  Device : {DEVICE}")
-    print(f"  Model  : {MODEL_NAME}")
-    print(f"  Epochs : {EPOCHS}  |  Batch: {BATCH_SIZE}  |  MaxLen: {MAX_LEN}")
+    print("  Fake News Detector — TF-IDF + Logistic Regression")
+    print("  Fast CPU mode  (no GPU / PyTorch needed)")
     print(f"{'='*58}")
 
     # 1. Load data
     df = load_dataset(csv_path)
-    train_df, val_df = train_test_split(
-        df, test_size=0.15, random_state=42, stratify=df["label"]
+    X = df["text"].tolist()
+    y = df["label"].tolist()
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
     )
-    print(f"  Train: {len(train_df)}  |  Val: {len(val_df)}\n")
+    print(f"\n  Train: {len(X_train)}  |  Test: {len(X_test)}\n")
 
-    # 2. Tokenizer + model (downloads ~260MB once, cached after)
-    print("Loading DistilBERT (first run downloads ~260 MB)...")
-    tokenizer = DistilBertTokenizerFast.from_pretrained(MODEL_NAME)
-    model     = DistilBertForSequenceClassification.from_pretrained(
-        MODEL_NAME, num_labels=2
-    )
-    model.to(DEVICE)
-    print("Model ready\n")
+    # 2. Build pipeline: TF-IDF -> Logistic Regression
+    print("  Training model...")
+    pipeline = Pipeline([
+        ("tfidf", TfidfVectorizer(
+            max_features=50000,   # top 50k words
+            ngram_range=(1, 2),   # unigrams + bigrams
+            sublinear_tf=True,    # log scaling
+            min_df=2,             # ignore very rare words
+            stop_words="english",
+        )),
+        ("clf", LogisticRegression(
+            C=1.0,
+            max_iter=1000,
+            solver="lbfgs",
+            n_jobs=-1,            # use all CPU cores
+        )),
+    ])
 
-    # 3. Tokenize all texts upfront
-    print("Tokenizing dataset...")
-    train_ds = FakeNewsDataset(train_df["text"].tolist(), train_df["label"].tolist(), tokenizer)
-    val_ds   = FakeNewsDataset(val_df["text"].tolist(),   val_df["label"].tolist(),   tokenizer)
-    print("Done\n")
+    pipeline.fit(X_train, y_train)
+    print("  Training complete!\n")
 
-    # num_workers=0 avoids Windows multiprocessing pickle errors
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    # 3. Evaluate
+    y_pred = pipeline.predict(X_test)
 
-    # 4. Optimizer + LR scheduler
-    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, eps=1e-8)
-    total_steps = len(train_loader) * EPOCHS
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(0.1 * total_steps),
-        num_training_steps=total_steps,
-    )
+    acc  = accuracy_score(y_test, y_pred)
+    f1   = f1_score(y_test, y_pred, average="weighted")
+    prec = precision_score(y_test, y_pred, average="weighted")
+    rec  = recall_score(y_test, y_pred, average="weighted")
+    cm   = confusion_matrix(y_test, y_pred)
 
-    # 5. Training loop
-    best_val_f1 = 0.0
-
-    for epoch in range(1, EPOCHS + 1):
-        print(f"{'─'*58}")
-        print(f"  Epoch {epoch} / {EPOCHS}")
-        print(f"{'─'*58}")
-
-        # Train
-        model.train()
-        total_loss = 0.0
-
-        for batch in tqdm(train_loader, desc="  Training", unit="batch"):
-            input_ids      = batch["input_ids"].to(DEVICE)
-            attention_mask = batch["attention_mask"].to(DEVICE)
-            labels         = batch["label"].to(DEVICE)
-
-            optimizer.zero_grad()
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
-            total_loss += loss.item()
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-
-        avg_loss = total_loss / len(train_loader)
-        print(f"\n  Train Loss : {avg_loss:.4f}")
-
-        # Validate
-        model.eval()
-        all_preds, all_labels = [], []
-
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc="  Validating", unit="batch"):
-                input_ids      = batch["input_ids"].to(DEVICE)
-                attention_mask = batch["attention_mask"].to(DEVICE)
-                labels         = batch["label"].to(DEVICE)
-
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                preds   = torch.argmax(outputs.logits, dim=1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-
-        acc = accuracy_score(all_labels, all_preds)
-        f1  = f1_score(all_labels, all_preds, average="weighted")
-
-        print(f"\n  +----------------------------------+")
-        print(f"  |  Val Accuracy :  {acc*100:6.2f}%         |")
-        print(f"  |  Val F1 Score :  {f1*100:6.2f}%         |")
-        print(f"  +----------------------------------+\n")
-        print(classification_report(
-            all_labels, all_preds,
-            target_names=["REAL", "FAKE"],
-            digits=4
-        ))
-
-        if f1 > best_val_f1:
-            best_val_f1 = f1
-            model.save_pretrained(MODEL_SAVE)
-            tokenizer.save_pretrained(MODEL_SAVE)
-            print(f"  Best model saved to '{MODEL_SAVE}/'  (F1={f1:.4f})\n")
-
-    print(f"\n{'='*58}")
-    print(f"  Training complete!")
-    print(f"  Best Validation F1 : {best_val_f1:.4f}")
-    print(f"  Model saved to     : {MODEL_SAVE}/")
+    print(f"{'='*58}")
+    print("  EVALUATION RESULTS")
+    print(f"{'='*58}")
+    print(f"  Accuracy  : {acc*100:.2f}%")
+    print(f"  F1 Score  : {f1*100:.2f}%")
+    print(f"  Precision : {prec*100:.2f}%")
+    print(f"  Recall    : {rec*100:.2f}%")
     print(f"{'='*58}\n")
-    print("Run a prediction:")
-    print('  python fake_news_detector.py --predict "Your article here"')
+
+    print("  Classification Report:")
+    print(classification_report(y_test, y_pred, target_names=["REAL", "FAKE"], digits=4))
+
+    print("  Confusion Matrix:")
+    print(f"                 Predicted REAL   Predicted FAKE")
+    print(f"  Actual REAL        {cm[0][0]:^10}       {cm[0][1]:^10}")
+    print(f"  Actual FAKE        {cm[1][0]:^10}       {cm[1][1]:^10}")
+    print()
+
+    # 4. Save model
+    with open(MODEL_SAVE, "wb") as f:
+        pickle.dump(pipeline, f)
+
+    print(f"  Model saved to '{MODEL_SAVE}'")
+    print(f"\n  Run a prediction:")
+    print(f'  python fake_news_detector.py --predict "Your article here"\n')
 
 # ─── Prediction ───────────────────────────────────────────────────────────────
 
-def predict(text: str, model_dir: str = MODEL_SAVE):
-    if not os.path.exists(model_dir):
+def predict(text: str, model_path: str = MODEL_SAVE):
+    if not os.path.exists(model_path):
         raise FileNotFoundError(
-            f"\n  Model folder '{model_dir}' not found.\n"
+            f"\n  Model file '{model_path}' not found.\n"
             f"  Train first:  python fake_news_detector.py --train fakenews.csv\n"
         )
 
-    print(f"\nLoading model from '{model_dir}'...")
-    tokenizer = DistilBertTokenizerFast.from_pretrained(model_dir)
-    model     = DistilBertForSequenceClassification.from_pretrained(model_dir)
-    model.to(DEVICE)
-    model.eval()
+    with open(model_path, "rb") as f:
+        pipeline = pickle.load(f)
 
-    encoding = tokenizer(
-        text,
-        add_special_tokens=True,
-        max_length=MAX_LEN,
-        padding="max_length",
-        truncation=True,
-        return_attention_mask=True,
-        return_tensors="pt",
-    )
-
-    with torch.no_grad():
-        outputs = model(
-            input_ids=encoding["input_ids"].to(DEVICE),
-            attention_mask=encoding["attention_mask"].to(DEVICE),
-        )
-
-    probs      = torch.softmax(outputs.logits, dim=1).cpu().numpy()[0]
+    probs      = pipeline.predict_proba([text])[0]
     pred_label = int(np.argmax(probs))
     label_map  = {0: "REAL", 1: "FAKE"}
 
     bar_real = "█" * int(probs[0] * 30)
     bar_fake = "█" * int(probs[1] * 30)
 
-    print("\n" + "=" * 54)
+    print("\n" + "=" * 56)
     print("   FAKE NEWS DETECTION RESULT")
-    print("=" * 54)
-    print(f"  Article   : {text[:75]}{'...' if len(text)>75 else ''}")
+    print("=" * 56)
+    print(f"  Article   : {text[:72]}{'...' if len(text)>72 else ''}")
     print()
     print(f"  Verdict   : {'[REAL NEWS]' if pred_label == 0 else '[FAKE NEWS]'}")
     print(f"  Confidence: {probs[pred_label]*100:.1f}%")
     print()
     print(f"  P(REAL)   : {probs[0]*100:5.1f}%  {bar_real}")
     print(f"  P(FAKE)   : {probs[1]*100:5.1f}%  {bar_fake}")
-    print("=" * 54)
+    print("=" * 56)
 
     return label_map[pred_label], probs
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+# ─── Entry Point ──────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fake News Detector using DistilBERT",
+        description="Fake News Detector (TF-IDF + Logistic Regression)",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=(
             "Examples:\n"
             "  python fake_news_detector.py --train fakenews.csv\n"
-            '  python fake_news_detector.py --predict "Doctors expose miracle cure hidden by Big Pharma!!"\n'
+            '  python fake_news_detector.py --predict "SHOCKING: Scientists EXPOSED hiding miracle cure!!"\n'
             '  python fake_news_detector.py --predict "Reuters: Fed raises rates by 25 basis points"\n'
         )
     )
     parser.add_argument("--train",   metavar="CSV",  help="Path to dataset CSV (e.g. fakenews.csv)")
     parser.add_argument("--predict", metavar="TEXT", help="Article text to classify")
-    parser.add_argument("--model",   metavar="DIR",  default=MODEL_SAVE,
-                        help=f"Saved model folder (default: {MODEL_SAVE})")
+    parser.add_argument("--model",   metavar="FILE", default=MODEL_SAVE,
+                        help=f"Saved model file (default: {MODEL_SAVE})")
     args = parser.parse_args()
 
     if args.train:
         train_model(args.train)
     elif args.predict:
-        predict(args.predict, model_dir=args.model)
+        predict(args.predict, model_path=args.model)
     else:
         parser.print_help()
 
